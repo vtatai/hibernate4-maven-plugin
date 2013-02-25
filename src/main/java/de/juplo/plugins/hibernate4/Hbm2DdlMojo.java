@@ -17,46 +17,29 @@ package de.juplo.plugins.hibernate4;
  */
 
 import com.pyx4j.log4j.MavenLogAppender;
-import java.io.File;
-import java.io.FileInputStream;
-import java.io.FileOutputStream;
-import java.io.IOException;
-import java.io.InputStream;
-import java.io.ObjectInputStream;
-import java.io.ObjectOutputStream;
-import java.math.BigInteger;
-import java.net.URL;
-import java.net.URLClassLoader;
-import java.security.MessageDigest;
-import java.sql.Connection;
-import java.sql.Driver;
-import java.sql.DriverManager;
-import java.sql.DriverPropertyInfo;
-import java.sql.SQLException;
-import java.sql.SQLFeatureNotSupportedException;
-import java.util.Comparator;
-import java.util.Enumeration;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Map;
-import java.util.Map.Entry;
-import java.util.Properties;
-import java.util.Set;
-import java.util.TreeSet;
-import java.util.logging.Logger;
-import javax.persistence.Embeddable;
-import javax.persistence.Entity;
-import javax.persistence.MappedSuperclass;
 import org.apache.maven.plugin.AbstractMojo;
 import org.apache.maven.plugin.MojoExecutionException;
 import org.apache.maven.plugin.MojoFailureException;
 import org.apache.maven.project.MavenProject;
 import org.hibernate.cfg.Configuration;
+import org.hibernate.envers.configuration.AuditConfiguration;
 import org.hibernate.tool.hbm2ddl.SchemaExport;
 import org.hibernate.tool.hbm2ddl.SchemaExport.Type;
 import org.hibernate.tool.hbm2ddl.Target;
 import org.scannotation.AnnotationDB;
+
+import javax.persistence.Embeddable;
+import javax.persistence.Entity;
+import javax.persistence.MappedSuperclass;
+import java.io.*;
+import java.math.BigInteger;
+import java.net.URL;
+import java.net.URLClassLoader;
+import java.security.MessageDigest;
+import java.sql.*;
+import java.util.*;
+import java.util.Map.Entry;
+import java.util.logging.Logger;
 
 
 /**
@@ -77,6 +60,7 @@ public class Hbm2DdlMojo extends AbstractMojo
   public final static String USERNAME = "hibernate.connection.username";
   public final static String PASSWORD = "hibernate.connection.password";
   public final static String DIALECT = "hibernate.dialect";
+  public final static String ENVERS = "hibernate.export.envers";
 
   private final static String MD5S = "schema.md5s";
 
@@ -212,6 +196,7 @@ public class Hbm2DdlMojo extends AbstractMojo
    *   <li><strong>SCRIPT</strong> export schema to SQL-script</li>
    *   <li><strong>BOTH</strong></li>
    * </ul>
+   *
    * @parameter expression="${hibernate.export.target}" default-value="EXPORT"
    */
   private String target;
@@ -224,6 +209,7 @@ public class Hbm2DdlMojo extends AbstractMojo
    *   <li><strong>DROP</strong> drop database-schema</li>
    *   <li><strong>BOTH</strong> (<strong>DEFAULT!</strong>)</li>
    * </ul>
+   *
    * @parameter expression="${hibernate.export.type}" default-value="BOTH"
    */
   private String type;
@@ -249,6 +235,17 @@ public class Hbm2DdlMojo extends AbstractMojo
    */
   private boolean format;
 
+  /**
+   * Generate envers schema for auditing tables.
+   *
+   * @parameter expression="${hibernate.export.envers}" default-value="false"
+   */
+  private Boolean envers;
+
+  /**
+   * Transient attribute, used only for knowing if the schema has changed since it was last run.
+   */
+  private boolean modified;
 
   @Override
   public void execute()
@@ -268,7 +265,7 @@ public class Hbm2DdlMojo extends AbstractMojo
       throw new MojoExecutionException("Cannot scan for annotated classes in " + outputDirectory + ": directory does not exist!");
 
     Map<String,String> md5s;
-    boolean modified = false;
+    modified = false;
     File saved = new File(buildDirectory + File.separator + MD5S);
 
     if (saved.exists())
@@ -299,7 +296,7 @@ public class Hbm2DdlMojo extends AbstractMojo
       }
     }
 
-    ClassLoader classLoader = null;
+    ClassLoader classLoader;
     try
     {
       getLog().debug("Creating ClassLoader for project-dependencies...");
@@ -319,89 +316,6 @@ public class Hbm2DdlMojo extends AbstractMojo
       getLog().error("Error while creating ClassLoader!", e);
       throw new MojoExecutionException(e.getMessage());
     }
-
-    Set<Class<?>> classes =
-        new TreeSet<Class<?>>(
-            new Comparator<Class<?>>() {
-              @Override
-              public int compare(Class<?> a, Class<?> b)
-              {
-                return a.getName().compareTo(b.getName());
-              }
-            }
-          );
-
-    try
-    {
-      AnnotationDB db = new AnnotationDB();
-      getLog().info("Scanning directory " + outputDirectory + " for annotated classes...");
-      URL dirUrl = dir.toURI().toURL();
-      db.scanArchives(dirUrl);
-      if (scanTestClasses)
-      {
-        dir = new File(testOutputDirectory);
-        if (!dir.exists())
-          throw new MojoExecutionException("Cannot scan for annotated test-classes in " + testOutputDirectory + ": directory does not exist!");
-        getLog().info("Scanning directory " + testOutputDirectory + " for annotated classes...");
-        dirUrl = dir.toURI().toURL();
-        db.scanArchives(dirUrl);
-      }
-
-      Set<String> classNames = new HashSet<String>();
-      if (db.getAnnotationIndex().containsKey(Entity.class.getName()))
-        classNames.addAll(db.getAnnotationIndex().get(Entity.class.getName()));
-      if (db.getAnnotationIndex().containsKey(MappedSuperclass.class.getName()))
-        classNames.addAll(db.getAnnotationIndex().get(MappedSuperclass.class.getName()));
-      if (db.getAnnotationIndex().containsKey(Embeddable.class.getName()))
-        classNames.addAll(db.getAnnotationIndex().get(Embeddable.class.getName()));
-
-      MessageDigest digest = java.security.MessageDigest.getInstance("MD5");
-      for (String name : classNames)
-      {
-        Class<?> annotatedClass = classLoader.loadClass(name);
-        classes.add(annotatedClass);
-        InputStream is =
-            annotatedClass
-                .getResourceAsStream(annotatedClass.getSimpleName() + ".class");
-        byte[] buffer = new byte[1024*4]; // copy data in 4MB-chunks
-        int i;
-        while((i = is.read(buffer)) > -1)
-          digest.update(buffer, 0, i);
-        is.close();
-        byte[] bytes = digest.digest();
-        BigInteger bi = new BigInteger(1, bytes);
-        String newMd5 = String.format("%0" + (bytes.length << 1) + "x", bi);
-        String oldMd5 = !md5s.containsKey(name) ? "" : md5s.get(name);
-        if (!newMd5.equals(oldMd5))
-        {
-          getLog().debug("Found new or modified annotated class: " + name);
-          modified = true;
-          md5s.put(name, newMd5);
-        }
-        else
-        {
-          getLog().debug(oldMd5 + " -> class unchanged: " + name);
-        }
-      }
-    }
-    catch (ClassNotFoundException e)
-    {
-      getLog().error("Error while adding annotated classes!", e);
-      throw new MojoExecutionException(e.getMessage());
-    }
-    catch (Exception e)
-    {
-      getLog().error("Error while scanning!", e);
-      throw new MojoFailureException(e.getMessage());
-    }
-
-    if (classes.isEmpty())
-      throw new MojoFailureException("No annotated classes found in directory " + outputDirectory);
-
-    getLog().debug("Detected classes with mapping-annotations:");
-    for (Class<?> annotatedClass : classes)
-      getLog().debug("  " + annotatedClass.getName());
-
 
     Properties properties = new Properties();
 
@@ -504,22 +418,43 @@ public class Hbm2DdlMojo extends AbstractMojo
       md5s.put(DIALECT, properties.getProperty(DIALECT));
     }
 
+    if (md5s.containsKey(ENVERS))
+    {
+      String envers = properties.getProperty(ENVERS);
+      if (md5s.get(ENVERS).equals(envers))
+        getLog().debug("Envers unchanged.");
+      else
+      {
+        getLog().debug("Envers changed: " + envers);
+        modified = true;
+        md5s.put(ENVERS, envers.toString());
+      }
+    }
+    else
+    {
+      modified = true;
+      md5s.put(ENVERS, properties.getProperty(ENVERS));
+    }
+
+    if (envers != null) {
+      if (properties.containsKey(ENVERS))
+        getLog().debug(
+            "Overwriting property " +
+                ENVERS + "=" + properties.getProperty(ENVERS) +
+                " with the value " + envers
+        );
+      else
+        getLog().debug("Using the value " + envers);
+      properties.setProperty(ENVERS, envers.toString());
+    }
+
     if (properties.isEmpty())
     {
       getLog().error("No properties set!");
       throw new MojoFailureException("Hibernate-Configuration is missing!");
     }
 
-    Configuration config = new Configuration();
-    config.setProperties(properties);
-    getLog().debug("Adding annotated classes to hibernate-mapping-configuration...");
-    for (Class<?> annotatedClass : classes)
-    {
-      getLog().debug("Class " + annotatedClass);
-      config.addAnnotatedClass(annotatedClass);
-    }
-
-    Target target = null;
+    Target target;
     try
     {
       target = Target.valueOf(this.target.toUpperCase());
@@ -530,7 +465,7 @@ public class Hbm2DdlMojo extends AbstractMojo
       getLog().error("Valid values are: NONE, SCRIPT, EXPORT, BOTH");
       throw new MojoExecutionException("Invalid value for configuration-option \"target\"");
     }
-    Type type = null;
+    Type type;
     try
     {
       type = Type.valueOf(this.type.toUpperCase());
@@ -624,6 +559,23 @@ public class Hbm2DdlMojo extends AbstractMojo
        * see all dependencies!
        */
       Thread.currentThread().setContextClassLoader(classLoader);
+
+      Set<Class<?>> classes = scanForAnnotations(dir, classLoader, md5s);
+
+      Configuration config = new Configuration();
+      config.setProperties(properties);
+      getLog().debug("Adding annotated classes to hibernate-mapping-configuration...");
+      for (Class<?> annotatedClass : classes)
+      {
+        getLog().debug("Class " + annotatedClass);
+        config.addAnnotatedClass(annotatedClass);
+      }
+      config.buildMappings();
+      if ("true".equals(properties.getProperty(ENVERS)))
+      {
+        getLog().debug("Using envers");
+        AuditConfiguration.getFor(config);
+      }
 
       SchemaExport export = new SchemaExport(config, connection);
       export.setOutputFile(outputFile);
@@ -766,5 +718,78 @@ public class Hbm2DdlMojo extends AbstractMojo
       DriverProxy other = (DriverProxy) obj;
       return this.target.equals(other.target);
     }
+  }
+
+  public Set<Class<?>> scanForAnnotations(File dir, ClassLoader classLoader, Map<String,String> md5s) throws MojoExecutionException, MojoFailureException {
+    Set<Class<?>> classes = new TreeSet<Class<?>>(
+        new Comparator<Class<?>>() {
+          @Override
+          public int compare(Class<?> a, Class<?> b) {
+            return a.getName().compareTo(b.getName());
+          }
+        }
+    );
+
+    try {
+      AnnotationDB db = new AnnotationDB();
+      getLog().info("Scanning directory " + outputDirectory + " for annotated classes...");
+      URL dirUrl = dir.toURI().toURL();
+      db.scanArchives(dirUrl);
+      if (scanTestClasses) {
+        dir = new File(testOutputDirectory);
+        if (!dir.exists())
+          throw new MojoExecutionException("Cannot scan for annotated test-classes in " + testOutputDirectory + ": directory does not exist!");
+        getLog().info("Scanning directory " + testOutputDirectory + " for annotated classes...");
+        dirUrl = dir.toURI().toURL();
+        db.scanArchives(dirUrl);
+      }
+
+      Set<String> classNames = new HashSet<String>();
+      if (db.getAnnotationIndex().containsKey(Entity.class.getName()))
+        classNames.addAll(db.getAnnotationIndex().get(Entity.class.getName()));
+      if (db.getAnnotationIndex().containsKey(MappedSuperclass.class.getName()))
+        classNames.addAll(db.getAnnotationIndex().get(MappedSuperclass.class.getName()));
+      if (db.getAnnotationIndex().containsKey(Embeddable.class.getName()))
+        classNames.addAll(db.getAnnotationIndex().get(Embeddable.class.getName()));
+
+      MessageDigest digest = java.security.MessageDigest.getInstance("MD5");
+      for (String name : classNames) {
+        Class<?> annotatedClass = classLoader.loadClass(name);
+        classes.add(annotatedClass);
+        InputStream is =
+            annotatedClass
+                .getResourceAsStream(annotatedClass.getSimpleName() + ".class");
+        byte[] buffer = new byte[1024*4]; // copy data in 4MB-chunks
+        int i;
+        while((i = is.read(buffer)) > -1)
+          digest.update(buffer, 0, i);
+        is.close();
+        byte[] bytes = digest.digest();
+        BigInteger bi = new BigInteger(1, bytes);
+        String newMd5 = String.format("%0" + (bytes.length << 1) + "x", bi);
+        String oldMd5 = !md5s.containsKey(name) ? "" : md5s.get(name);
+        if (!newMd5.equals(oldMd5))
+        {
+          getLog().debug("Found new or modified annotated class: " + name);
+          modified = true;
+          md5s.put(name, newMd5);
+        }
+        else
+        {
+          getLog().debug(oldMd5 + " -> class unchanged: " + name);
+        }
+      }
+    } catch (Exception e) {
+      getLog().error("Error while scanning!", e);
+      throw new MojoFailureException(e.getMessage());
+    }
+
+    if (classes.isEmpty())
+      throw new MojoFailureException("No annotated classes found in directory " + outputDirectory);
+
+    getLog().debug("Detected classes with mapping-annotations:");
+    for (Class<?> annotatedClass : classes)
+      getLog().debug("  " + annotatedClass.getName());
+    return classes;
   }
 }
